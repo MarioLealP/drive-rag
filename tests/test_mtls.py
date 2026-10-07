@@ -234,3 +234,11 @@ def test_renewed_cert_is_picked_up(pki, server):
     time.sleep(1.0)
     _, after = _get(pki, port, "core.bundle")
     assert before["serialNumber"] != after["serialNumber"]
+
+
+def test_refusal_logs_no_traceback(pki, server, caplog):
+    """A refused peer is one warning line, not an asyncio callback traceback."""
+    test_other_felt_identity_refused(pki, server)
+    time.sleep(0.3)
+    assert "is not allowed" in caplog.text
+    assert "Exception in callback" not in caplog.text

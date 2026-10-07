@@ -42,9 +42,15 @@ def make_protocol(allowed: frozenset[str]):
                     transport.get_extra_info("peername"),
                     uris or "none",
                 )
+                self._refused = True
                 transport.abort()
                 return
             super().connection_made(transport)
+
+        def connection_lost(self, exc):
+            if getattr(self, "_refused", False):  # nothing was set up to tear down
+                return
+            super().connection_lost(exc)
 
     return MTLSProtocol
 
