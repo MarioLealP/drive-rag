@@ -15,4 +15,6 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen --group server
       # no unit tests yet: the app must at least import (model + DB load in lifespan)
-      - run: uv run python -c "import server.app"
+      - run: uv run python -c "import server.app, server.serve"
+      # WP-62 M2b B5.2: the mTLS server against a real test PKI (needs the openssl CLI)
+      - run: uv run --with pytest python -m pytest -v tests/

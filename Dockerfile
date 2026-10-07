@@ -18,5 +18,5 @@ RUN uv run python -c "from model2vec import StaticModel; StaticModel.from_pretra
 COPY server/ ./server/
 
 EXPOSE 8000
-CMD ["uv", "run", "--no-dev", "--group", "server", "uvicorn", "server.app:app", \
-     "--host", "0.0.0.0", "--port", "8000"]
+# plain uvicorn, or mTLS when DRIVE_RAG_TLS_BUNDLE is set (server/serve.py, WP-62 M2b)
+CMD ["uv", "run", "--no-dev", "--group", "server", "python", "-m", "server.serve"]
