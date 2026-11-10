@@ -242,3 +242,103 @@ def test_refusal_logs_no_traceback(pki, server, caplog):
     time.sleep(0.3)
     assert "is not allowed" in caplog.text
     assert "Exception in callback" not in caplog.text
+
+
+# Meru mode (D127): pki_meru-shaped CA -> leaves naming <app>.<namespace>.svc (DNS only), separate cert + key files.
+
+
+@pytest.fixture(scope="module")
+def meru(tmp_path_factory):
+    d = tmp_path_factory.mktemp("meru")
+    _openssl(
+        "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-keyout", "meru.key", "-subj", "/CN=meru", "-days", "2", "-out", "meru.pem",
+        "-addext", "basicConstraints=critical,CA:true",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign",  # as pki_meru's root; Python 3.13+ requires it
+        cwd=d,
+    )
+    for ca in ("wrong",):
+        _openssl(
+            "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+            "-keyout", f"{ca}.key", "-subj", f"/CN={ca}", "-days", "2", "-out", f"{ca}.pem",
+            "-addext", "basicConstraints=critical,CA:true",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            cwd=d,
+        )
+    leaf = "basicConstraints=critical,CA:false\nsubjectAltName="
+    for name, issuer, sans in (
+        ("srv", "meru", "drive-rag.drive-rag.svc,DNS:drive-rag.drive-rag.svc.cluster.local"),
+        ("srv2", "meru", "drive-rag.drive-rag.svc,DNS:drive-rag.drive-rag.svc.cluster.local"),
+        ("core", "meru", "felt-core.felt-core.svc,DNS:felt-core.felt-core.svc.cluster.local"),
+        ("poe2", "meru", "poe2rag.poe2rag.svc,DNS:poe2rag.poe2rag.svc.cluster.local"),
+        ("rogue", "wrong", "felt-core.felt-core.svc"),
+    ):
+        _leaf(d, name, issuer, leaf + f"DNS:{sans}\n")
+    return d
+
+
+@pytest.fixture(scope="module")
+def meru_server(meru):
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    cert, key = meru / "tls.crt", meru / "tls.key"
+    shutil.copy(meru / "srv.pem", cert)
+    shutil.copy(meru / "srv.key", key)
+    threading.Thread(
+        target=mtls.serve,
+        args=(_app, "127.0.0.1", port, str(cert), str(meru / "meru.pem"), ["felt-core.felt-core.svc"], 0.2),
+        kwargs={"key": str(key), "kind": "DNS"},
+        daemon=True,
+    ).start()
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", port), 0.2).close()
+            break
+        except OSError:
+            time.sleep(0.1)
+    return port, cert, key
+
+
+def _meru_get(meru, port, client=None):
+    """GET / as felt-core would on k3s: trust Meru's CA, verify drive-rag by its Service name."""
+    ctx = ssl.create_default_context(cafile=str(meru / "meru.pem"))
+    if client:
+        ctx.load_cert_chain(str(meru / f"{client}.pem"), str(meru / f"{client}.key"))
+    with ctx.wrap_socket(
+        socket.create_connection(("127.0.0.1", port), 5), server_hostname="drive-rag.drive-rag.svc"
+    ) as s:
+        cert = s.getpeercert()
+        s.sendall(b"GET / HTTP/1.1\r\nHost: drive-rag.drive-rag.svc\r\nConnection: close\r\n\r\n")
+        return s.recv(200), cert
+
+
+def test_meru_felt_core_gets_through(meru, meru_server):
+    data, _ = _meru_get(meru, meru_server[0], "core")
+    assert data.startswith(b"HTTP/1.1 200")
+
+
+@pytest.mark.parametrize("client", [None, "poe2", "rogue"])
+def test_meru_others_refused(meru, meru_server, client):
+    """No cert, another namespace's Service name, or felt-core's name from another CA."""
+    try:
+        data, _ = _meru_get(meru, meru_server[0], client)
+    except (ssl.SSLError, ConnectionError):
+        return
+    assert data == b""
+
+
+def test_meru_renewed_cert_is_picked_up(meru, meru_server):
+    port, cert, key = meru_server
+    _, before = _meru_get(meru, port, "core")
+    shutil.copy(meru / "srv2.key", key)
+    shutil.copy(meru / "srv2.pem", cert)
+    time.sleep(1.0)
+    _, after = _meru_get(meru, port, "core")
+    assert before["serialNumber"] != after["serialNumber"]
+
+
+def test_meru_kind_is_checked():
+    with pytest.raises(ValueError):
+        mtls.serve(_app, "127.0.0.1", 0, "c", "a", [], key="k", kind="CN")
