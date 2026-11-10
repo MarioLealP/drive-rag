@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 
+from .auth import require_caller
 from .retrieve import Hit, connect, search
 
 DB = os.getenv("DRIVE_DB", "data/drive.db")
@@ -83,7 +85,7 @@ async def health():
 
 
 @app.post("/api/ask")
-async def ask(body: Ask):
+async def ask(body: Ask, _caller: Annotated[str | None, Depends(require_caller)]):
     hits = search(state["db"], embed_query(body.question), body.question, k=TOP_K)
     sources = [
         {"n": i, "title": h.title, "url": h.url, "section": h.section} for i, h in enumerate(hits, 1)

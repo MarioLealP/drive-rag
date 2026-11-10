@@ -11,7 +11,12 @@ helper as ``bundle.pem`` (key + cert + intermediate) next to ``felt-ca.pem``
   ``allowed`` (felt-core's), checked before a single request byte is read.
 - The server cert is re-read when the bundle changes (renewed hourly).
 
-Off unless DRIVE_RAG_TLS_BUNDLE is set (plain HTTP as before).
+Meru mode (D127, on k3s): the same server with Meru's in-cluster certs (nuwa-app ``certificate``: ``tls.crt``,
+``tls.key``, ``ca.crt`` from OpenBao ``pki_meru``). Those carry DNS names only - ``<app>.<namespace>.svc``, a name
+pki_meru signs only for a pod of that namespace - so the peer passes when one of its DNS names is allowed
+(``kind="DNS"``). Who is calling and what it may do is the Authentik token on top (server/auth.py).
+
+Off unless DRIVE_RAG_TLS_BUNDLE or DRIVE_RAG_TLS_CERT is set (plain HTTP as before).
 """
 
 import logging
@@ -25,22 +30,34 @@ from uvicorn.protocols.http.auto import AutoHTTPProtocol
 log = logging.getLogger(__name__)
 
 
-def peer_uris(transport) -> list[str]:
+def peer_names(transport, kind: str = "URI") -> list[str]:
     cert = transport.get_extra_info("peercert") or {}
-    return [v for k, v in cert.get("subjectAltName", ()) if k == "URI"]
+    return [v for k, v in cert.get("subjectAltName", ()) if k == kind]
 
 
-def make_protocol(allowed: frozenset[str]):
+def peer_uris(transport) -> list[str]:
+    return peer_names(transport, "URI")
+
+
+def is_allowed(names: list[str], allowed: frozenset[str], kind: str) -> bool:
+    """URI (Felt certs): exactly one SPIFFE identity, and it's allowed. DNS (Meru certs): a cert names its Service
+    twice (``.svc`` and ``.svc.cluster.local``), so one allowed name is enough."""
+    if kind == "URI":
+        return len(names) == 1 and names[0] in allowed
+    return any(n in allowed for n in names)
+
+
+def make_protocol(allowed: frozenset[str], kind: str = "URI"):
     """The HTTP protocol, refusing any peer whose identity isn't allowed."""
 
     class MTLSProtocol(AutoHTTPProtocol):
         def connection_made(self, transport):  # after the TLS handshake
-            uris = peer_uris(transport)
-            if len(uris) != 1 or uris[0] not in allowed:
+            names = peer_names(transport, kind)
+            if not is_allowed(names, allowed, kind):
                 log.warning(
                     "refused TLS client %s: identity %s is not allowed",
                     transport.get_extra_info("peername"),
-                    uris or "none",
+                    names or "none",
                 )
                 self._refused = True
                 transport.abort()
@@ -62,16 +79,21 @@ def harden(ctx: ssl.SSLContext) -> None:
 
 
 def watch_bundle(
-    ctx: ssl.SSLContext, bundle: str, interval: float, stop: threading.Event
+    ctx: ssl.SSLContext,
+    bundle: str,
+    interval: float,
+    stop: threading.Event,
+    key: str | None = None,
 ) -> None:
     """Reload the server cert into the live context whenever the renewer
-    replaces the bundle."""
+    replaces the bundle (or, Meru mode, the kubelet swaps the Secret's files:
+    both names follow the same new ``..data`` link, so cert and key match)."""
     seen = os.stat(bundle).st_mtime_ns
     while not stop.wait(interval):
         try:
             now = os.stat(bundle).st_mtime_ns
             if now != seen:
-                ctx.load_cert_chain(bundle)
+                ctx.load_cert_chain(bundle, key)
                 seen = now
                 log.info("reloaded the server certificate from %s", bundle)
         except (OSError, ssl.SSLError) as e:
@@ -81,23 +103,35 @@ def watch_bundle(
 
 
 def serve(
-    app, host: str, port: int, bundle: str, ca: str, allowed, reload_s: float = 60
+    app,
+    host: str,
+    port: int,
+    bundle: str,
+    ca: str,
+    allowed,
+    reload_s: float = 60,
+    *,
+    key: str | None = None,
+    kind: str = "URI",
 ) -> None:
+    """``bundle`` is the cert (+ key when ``key`` is None, as the Felt bundle.pem); ``kind`` the SAN type checked."""
+    if kind not in ("URI", "DNS"):
+        raise ValueError(f"kind must be URI or DNS, not {kind!r}")
     config = uvicorn.Config(
         app,
         host=host,
         port=port,
         ssl_certfile=bundle,
-        ssl_keyfile=bundle,
+        ssl_keyfile=key or bundle,
         ssl_ca_certs=ca,
         ssl_cert_reqs=ssl.CERT_REQUIRED,
-        http=make_protocol(frozenset(allowed)),
+        http=make_protocol(frozenset(allowed), kind),
     )
     config.load()
     harden(config.ssl)
     stop = threading.Event()
     threading.Thread(
-        target=watch_bundle, args=(config.ssl, bundle, reload_s, stop), daemon=True
+        target=watch_bundle, args=(config.ssl, bundle, reload_s, stop, key), daemon=True
     ).start()
     log.info(
         "mTLS on %s:%s, allowed clients: %s", host, port, ", ".join(sorted(allowed))
