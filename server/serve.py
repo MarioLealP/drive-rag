@@ -12,6 +12,7 @@ Meru mode (k3s, D127 - nuwa-app's certificate, files from pki_meru):
   DRIVE_RAG_TLS_CA           ca.crt (Meru's in-cluster CA)
   DRIVE_RAG_TLS_ALLOWED_DNS  allowed client Service names, comma-separated
                              (default: felt-core.felt-core.svc)
+  DRIVE_RAG_HEALTH_PORT      a plain-HTTP port for the kubelet's probes, GET /api/health only (server/health.py)
   + the Authentik token check, server/auth.py (DRIVE_RAG_AUTH_*).
 """
 
@@ -52,6 +53,10 @@ def main() -> None:
     if not key:
         raise SystemExit("DRIVE_RAG_TLS_CERT is set but DRIVE_RAG_TLS_KEY isn't")
     allowed = _names("DRIVE_RAG_TLS_ALLOWED_DNS", FELT_CORE_SVC)
+    if health_port := os.environ.get("DRIVE_RAG_HEALTH_PORT"):
+        from server import health
+
+        health.start(host, int(health_port), port)
     mtls.serve(app, host, port, cert, ca, allowed, key=key, kind="DNS")
 
 
